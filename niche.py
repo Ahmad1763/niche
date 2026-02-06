@@ -1,105 +1,78 @@
 import streamlit as st
-import pandas as pd
-from googleapiclient.discovery import build
-from datetime import datetime, timedelta
+import json
+import urllib.request
+from datetime import datetime
 
-# --- SETTINGS & AUTH ---
-st.set_page_config(page_title="YouTube Niche Researcher", layout="wide")
-st.title("🔍 YouTube Niche Research Tool")
+st.set_page_config(page_title="Niche Researcher (Lite)", layout="wide")
+st.title("🔍 No-Dependency Niche Researcher")
 
-# Input for API Key (Keep it safe in Streamlit Secrets on GitHub)
-API_KEY = st.sidebar.text_input("Enter YouTube API Key", type="password")
+# Authentication
+api_key = st.sidebar.text_input("YouTube API Key", type="password")
 
-if not API_KEY:
-    st.warning("Please enter your YouTube API Key in the sidebar to begin.")
+if not api_key:
+    st.info("Enter your API key to start. Since this uses no external libraries, it's highly stable!")
     st.stop()
 
-youtube = build('youtube', 'v3', developerKey=API_KEY)
+query = st.text_input("Niche Keyword", "Handmade Soap DIY")
 
-# --- HELPER FUNCTIONS ---
-def get_channel_data(channel_id):
-    request = youtube.channels().list(
-        part="snippet,statistics",
-        id=channel_id
-    )
-    response = request.execute()
-    if response['items']:
-        item = response['items'][0]
-        return {
-            "title": item['snippet']['title'],
-            "subs": int(item['statistics']['subscriberCount']),
-            "publishedAt": item['snippet']['publishedAt']
-        }
-    return None
-
-# --- SEARCH LOGIC ---
-query = st.text_input("Enter Niche Keyword (e.g., 'AI Automations')", "ASMR for Squirrels")
+def fetch_youtube_data(url):
+    try:
+        with urllib.request.urlopen(url) as response:
+            return json.loads(response.read().decode())
+    except Exception as e:
+        st.error(f"API Error: {e}")
+        return None
 
 if st.button("Analyze Niche"):
-    with st.spinner("Scraping YouTube data..."):
-        # 1. Search for videos
-        search_request = youtube.search().list(
-            q=query,
-            part="snippet",
-            maxResults=15,
-            type="video"
-        )
-        search_response = search_request.execute()
-        
+    # 1. Search Request
+    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={query.replace(' ', '%20')}&type=video&maxResults=10&key={api_key}"
+    search_data = fetch_youtube_data(search_url)
+
+    if search_data:
         results = []
-        new_channels_count = 0
-        total_videos_found = len(search_response['items'])
+        new_channels = 0
         
-        for item in search_response['items']:
+        for item in search_data.get('items', []):
             channel_id = item['snippet']['channelId']
-            channel_info = get_channel_data(channel_id)
             
-            if channel_info:
-                # Calculate Age
-                pub_date = datetime.strptime(channel_info['publishedAt'], "%Y-%m-%dT%H:%M:%SZ")
-                age_days = (datetime.now() - pub_date).days
-                is_new = age_days < 90  # 3 Months check
+            # 2. Get Channel Stats (Subs & Date)
+            channel_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id={channel_id}&key={api_key}"
+            c_data = fetch_youtube_data(channel_url)
+            
+            if c_data and 'items' in c_data:
+                info = c_data['items'][0]
+                subs = int(info['statistics'].get('subscriberCount', 0))
+                pub_date_str = info['snippet']['publishedAt']
                 
-                if is_new: new_channels_count += 1
+                # Manual date parsing (no external libs)
+                pub_date = datetime.strptime(pub_date_str[:10], "%Y-%m-%d")
+                age_days = (datetime.now() - pub_date).days
+                is_new = age_days < 90
+
+                if is_new: new_channels += 1
                 
                 results.append({
-                    "Channel": channel_info['title'],
-                    "Subscribers": channel_info['subs'],
-                    "Age (Days)": age_days,
-                    "New Channel?": "✅" if is_new else "❌"
+                    "Channel": info['snippet']['title'],
+                    "Subs": subs,
+                    "Age": f"{age_days} days",
+                    "Status": "✅ NEW" if is_new else "Old"
                 })
 
-        df = pd.DataFrame(results)
+        # --- Display Logic ---
+        st.subheader("Selection Criteria Results")
+        col1, col2 = st.columns(2)
 
-        # --- CRITERIA EVALUATION ---
-        st.subheader("📊 Niche Selection Criteria Results")
-        
-        c1, c2, c3 = st.columns(3)
-        
-        # Criterion 1: Channel Size Limit (<20k)
-        max_subs = df['Subscribers'].max()
-        c1.metric("Max Subs Found", f"{max_subs:,}")
+        # Requirement 1: Size Limit
+        max_subs = max([r['Subs'] for r in results]) if results else 0
         if max_subs < 20000:
-            c1.success("Requirement 1: PASSED (<20k subs)")
+            col1.success(f"PASSED: Max subs is {max_subs:,} (Limit: 20k)")
         else:
-            c1.error("Requirement 1: FAILED (>20k subs)")
+            col1.error(f"FAILED: Large channel found ({max_subs:,} subs)")
 
-        # Criterion 2: Channel Age (2-3 channels < 3 months old)
-        c2.metric("New Channels Found", new_channels_count)
-        if new_channels_count >= 2:
-            c2.success("Requirement 2: PASSED (New channels active)")
+        # Requirement 2: New Channels
+        if new_channels >= 2:
+            col2.success(f"PASSED: Found {new_channels} channels < 3 months old")
         else:
-            c2.error("Requirement 2: FAILED (No new players)")
+            col2.error(f"FAILED: Only found {new_channels} new channels")
 
-        # Criterion 6: Competition Count
-        unique_competitors = df['Channel'].nunique()
-        c3.metric("Total Competitors", unique_competitors)
-        if unique_competitors <= 10:
-            c3.success("Requirement 6: PASSED (Low competition)")
-        else:
-            c3.warning("Requirement 6: FAILED (Crowded niche)")
-
-        # --- DATA TABLE ---
-        st.divider()
-        st.write("### Raw Competitor Data")
-        st.dataframe(df.style.highlight_max(axis=0, subset=['Subscribers'], color='#ff4b4b'))
+        st.table(results)
